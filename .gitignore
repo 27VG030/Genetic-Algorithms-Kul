@@ -20,10 +20,10 @@ env/
 .DS_Store
 
 # Outputs
-outputs/
 results/
-figures/
+
 
 # Large data files, only if not required
 *.zip
 *.tar.gz
+benchmark/

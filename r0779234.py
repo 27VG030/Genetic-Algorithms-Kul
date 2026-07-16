@@ -15,13 +15,13 @@ class EAConfig:
     min_alpha: float = 0.05 # floor for self-adaptive alpha
     
     # --- Initialization 
-    nn_init_share: float = 0.2 # fraction of population from nearest neighbor
-    lso_init_share: float = 0.5 # fraction of random init tours to improve with LS
+    nn_init_share: float = 0.2 # fraction of population from nearest neighbor - 30% RCL tours, 70% random (diversity)
+    lso_init_share: float = 0.5 # fraction of random init tours to improve with LS -  50% of init tours get 2-opt
     initialize_random: bool = False 
     
     # --- Local search intensity
-    lso_variation_share: float = 1.0 # fraction of population to LS after variation
-    lso_max_changes: int = 100 # cap for 2-opt/3-opt
+    lso_variation_share: float = 0.3 # fraction of population to LS after variation
+    lso_max_changes: int = 50 # cap for 2-opt/3-opt
     local_search_initialisation: bool = True
     local_search_variation: bool = True
     
@@ -54,9 +54,10 @@ class EAConfig:
     # --- Operator choices
     elimination: str = "lambda_mu"
     selection: str = "tournament"
-    initialisation: str = "random" # "nn" | "random"
-    recombination: str = "pmx" # "pmx" | "edge" | "cx" | "ox" | "csox"
-    mutations: tuple[str, ...] = ("scramble",) # single or pool
+    initialisation: str = "nn" # "nn" | "random" -> RCL init
+    k_greedy: int = 1 # 1=greedy NN; 3–5=real RCL randomization
+    recombination: str = "ox" # "pmx" | "edge" | "cx" | "ox" | "csox"
+    mutations: tuple[str, ...] = ("swap", "insert", "inversion") # single or pool
     local_search: str = "2opt" # "2opt" | "3opt"
     
     # --- Resolved once
@@ -179,7 +180,7 @@ def report_stats(population: list[Individual]) -> tuple[float, float, np.ndarray
 # INITIALISATION
 
 def random_initialisation(distance_matrix: np.ndarray, cfg: EAConfig) -> list[Individual]:
-    """random permutations + optional LS."""
+    """random permutations + optional LS. (O(n))"""
     population = []
     for _ in range(cfg.llambda):
         perm = np.random.permutation(cfg.length)
@@ -190,11 +191,116 @@ def random_initialisation(distance_matrix: np.ndarray, cfg: EAConfig) -> list[In
         population.append(ind)
     return population
 
-def nn_initialisation(distance_matrix: np.ndarray, cfg: EAConfig) -> list[Individual]:
-    """falls back to random until implemented."""
-    # TODO: greedy NN + diversification + cfg.nn_init_share / random_init_size split
-    return random_initialisation(distance_matrix, cfg)
 
+@njit
+def _rcl_nn_tour_fast(distance_matrix: np.ndarray, start_node: int, k: int, no_inf: bool) -> np.ndarray:
+    """
+    Blazing fast Numba kernel for randomized nearest neighbor via Restricted Candidate List.
+    Complexity: O(k * N) per step, resulting in O(k * N^2) total construction time.
+    """
+    n = distance_matrix.shape[0]
+    tour = np.empty(n, dtype=np.int64)
+    visited = np.zeros(n, dtype=np.bool_)
+    
+    current = start_node
+    tour[0] = current
+    visited[current] = True
+    
+    # Pre-allocate candidate tracking arrays to avoid memory overhead inside the loop
+    candidates = np.empty(k, dtype=np.int64)
+    cand_costs = np.empty(k, dtype=np.float64)
+    
+    for step in range(1, n):
+        # Reset the candidate pool for the current step
+        for i in range(k):
+            cand_costs[i] = np.inf
+            candidates[i] = -1
+            
+        valid_count = 0
+        
+        # Scan unvisited nodes to maintain the top-k nearest neighbors
+        for j in range(n):
+            if not visited[j]:
+                cost = distance_matrix[current, j]
+                
+                # Skip strictly infinite edges if the configuration demands it
+                if no_inf and cost == np.inf:
+                    continue
+                    
+                # Insertion sort logic into the top-k arrays
+                if cost < cand_costs[k - 1]:
+                    insert_idx = k - 1
+                    while insert_idx > 0 and cost < cand_costs[insert_idx - 1]:
+                        insert_idx -= 1
+                    
+                    # Shift elements right to make room
+                    for m in range(k - 1, insert_idx, -1):
+                        cand_costs[m] = cand_costs[m - 1]
+                        candidates[m] = candidates[m - 1]
+                        
+                    # Insert new candidate
+                    cand_costs[insert_idx] = cost
+                    candidates[insert_idx] = j
+                    
+                    if valid_count < k:
+                        valid_count += 1
+                        
+        if valid_count == 0:
+            # Dead end reached (graph disconnected or all paths are np.inf). 
+            # Fallback: pick the first available unvisited node to complete a valid permutation.
+            for j in range(n):
+                if not visited[j]:
+                    current = j
+                    break
+        else:
+            # Randomly select one city from the restricted candidate list
+            limit = min(k, valid_count)
+            chosen = np.random.randint(limit)
+            current = candidates[chosen]
+            
+        tour[step] = current
+        visited[current] = True
+        
+    return tour
+
+
+def nn_initialisation(distance_matrix: np.ndarray, cfg: EAConfig) -> list[Individual]:
+    """
+    Initializes a population using the Randomized Nearest Neighbor (RCL) algorithm.
+    Splits the initialization pool between RCL and pure random based on EAConfig.
+    """
+    population = []
+    n = cfg.length
+    
+    # If the user sets k_greedy = 1, this acts as a pure greedy nearest neighbor.
+    # A value between 3 and 5 is recommended for optimal RCL diversity.
+    k_val = max(1, cfg.k_greedy) 
+    
+    # Generate the RCL Nearest Neighbor portion
+    for _ in range(cfg.nn_init_size):
+        start_node = np.random.randint(n)
+        perm = _rcl_nn_tour_fast(distance_matrix, start_node, k_val, cfg.no_inf)
+        
+        # Apply Local Search Operator (LSO) conditionally to the initialized individual
+        if cfg.local_search_initialisation and np.random.rand() < cfg.lso_init_share:
+            perm = cfg.local_search_fn(distance_matrix, perm, cfg.lso_max_changes)
+            
+        ind = Individual(perm, alpha=cfg.alpha)
+        ind.update_fitness(distance_matrix)
+        population.append(ind)
+        
+    # Fill the remaining population size with pure random permutations
+    for _ in range(cfg.random_init_size):
+        perm = np.random.permutation(n)
+        
+        if cfg.local_search_initialisation and np.random.rand() < cfg.lso_init_share:
+            perm = cfg.local_search_fn(distance_matrix, perm, cfg.lso_max_changes)
+            
+        ind = Individual(perm, alpha=cfg.alpha)
+        ind.update_fitness(distance_matrix)
+        population.append(ind)
+        
+    return population
 
 # SELECTION
 def k_t_selection(population: list[Individual], cfg: EAConfig) -> Individual:
@@ -249,45 +355,204 @@ def _child_from_tour(tour: np.ndarray, parent1: Individual, parent2: Individual,
         child.alpha = max(cfg.min_alpha, parent1.alpha + beta * (parent2.alpha - parent1.alpha))
     return child
 
-def order_crossover(parent1: Individual, parent2: Individual, cfg: EAConfig) -> list[Individual]:
-    """DRY RUN: OX crossover."""
-    p1, p2 = parent1.permutation, parent2.permutation
+
+# Numba kernels
+
+@njit
+def _ox_kernel(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    """O(N) Order Crossover Kernel"""
     n = len(p1)
-    i, j = sorted(np.random.choice(n, 2, replace=False))
     child = np.full(n, -1, dtype=np.int64)
-    child[i : j + 1] = p1[i : j + 1]
-    fill = [x for x in p2 if x not in child]
-    idx = 0
-    for k in range(n):
-        if child[k] == -1:
-            child[k] = fill[idx]
-            idx += 1
-    return [_child_from_tour(child, parent1, parent2, cfg)]
-
-def partially_mapped_crossover(parent1: Individual, parent2: Individual, cfg: EAConfig) -> list[Individual]:
-    """use OX until PMX is implemented."""
-    return order_crossover(parent1, parent2, cfg)
-
-def cycle_crossover(parent1: Individual, parent2: Individual, cfg: EAConfig) -> list[Individual]:
-    """."""
-    return order_crossover(parent1, parent2, cfg)
-
-def c_s_order_crossover(parent1: Individual, parent2: Individual, cfg: EAConfig) -> list[Individual]:
-    """coordinated OX variant."""
-    return order_crossover(parent1, parent2, cfg)
-
-def edge_crossover(parent1: Individual, parent2: Individual, cfg: EAConfig) -> list[Individual]:
-    """slow in Python"""
-    return order_crossover(parent1, parent2, cfg)
-
-# Optional helpers when implementing edge crossover:
-def remove_ref(edge_table: dict, elem: int) -> None:
-    for key in edge_table:
-        edge_table[key] = [x for x in edge_table[key] if x != elem]
+    
+    i, j = np.random.choice(n, 2, replace=False)
+    if i > j:
+        i, j = j, i
         
-def find_next_element(edge_table: dict, elem: int) -> int:
-    # TODO: pick best edge from table
-    return edge_table[elem][0]
+    visited = np.zeros(n, dtype=np.bool_)
+    
+    # Copy segment from p1
+    for k in range(i, j + 1):
+        child[k] = p1[k]
+        visited[p1[k]] = True
+        
+    # Fill remaining from p2
+    idx = (j + 1) % n
+    for k in range(n):
+        p2_val = p2[(j + 1 + k) % n]
+        if not visited[p2_val]:
+            child[idx] = p2_val
+            idx = (idx + 1) % n
+            
+    return child
+
+@njit
+def _pmx_kernel(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    """O(N) Partially Mapped Crossover Kernel"""
+    n = len(p1)
+    child = np.full(n, -1, dtype=np.int64)
+    
+    i, j = np.random.choice(n, 2, replace=False)
+    if i > j:
+        i, j = j, i
+        
+    in_segment = np.zeros(n, dtype=np.bool_)
+    redirect = np.arange(n, dtype=np.int64)
+    # Copy segment from p1; build redirect pairs (p1[k] <-> p2[k])
+    for k in range(i, j + 1):
+        child[k] = p1[k]
+        in_segment[p1[k]] = True
+        redirect[p1[k]] = p2[k]
+        
+    # Fill outside positions from p2, resolving conflicts via redirect chain
+    for k in range(n):
+        if i <= k <= j:
+            continue
+        val = p2[k]
+        while in_segment[val]:
+            val = redirect[val]
+        child[k] = val
+    return child
+
+@njit
+def _erx_kernel(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    """O(N) Edge Recombination Crossover Kernel using flat arrays instead of dicts"""
+    n = len(p1)
+    
+    # edge_table: [city_id, neighbor_index] -> neighbor_city_id
+    # Max 4 unique neighbors per city in TSP crossover
+    edge_table = np.full((n, 4), -1, dtype=np.int64)
+    edge_counts = np.zeros(n, dtype=np.int64)
+    
+    # Build edge table in O(N)
+    for p in (p1, p2):
+        for k in range(n):
+            city = p[k]
+            left, right = p[(k - 1) % n], p[(k + 1) % n]
+            
+            # Insert left neighbor if not present
+            found_l = False
+            for c in range(edge_counts[city]):
+                if edge_table[city, c] == left:
+                    found_l = True
+                    break
+            if not found_l and edge_counts[city] < 4:
+                edge_table[city, edge_counts[city]] = left
+                edge_counts[city] += 1
+                
+            # Insert right neighbor if not present
+            found_r = False
+            for c in range(edge_counts[city]):
+                if edge_table[city, c] == right:
+                    found_r = True
+                    break
+            if not found_r and edge_counts[city] < 4:
+                edge_table[city, edge_counts[city]] = right
+                edge_counts[city] += 1
+
+    child = np.empty(n, dtype=np.int64)
+    visited = np.zeros(n, dtype=np.bool_)
+    
+    current = p1[0] if np.random.rand() < 0.5 else p2[0]
+    
+    for step in range(n):
+        child[step] = current
+        visited[current] = True
+        
+        # Remove current from all neighbor lists (simulate by ignoring visited later)
+        
+        if step == n - 1:
+            break
+            
+        # Find next node: minimum edges remaining
+                # Find next node: minimum edges remaining
+        best_next = -1
+        min_edges = n + 1
+        first_valid = -1
+
+        for idx in range(edge_counts[current]):
+            candidate = edge_table[current, idx]
+            if visited[candidate]:
+                continue
+
+            if first_valid == -1:
+                first_valid = candidate
+
+            c_edges = 0
+            for j in range(edge_counts[candidate]):
+                if not visited[edge_table[candidate, j]]:
+                    c_edges += 1
+
+            if c_edges < min_edges:
+                min_edges = c_edges
+                best_next = candidate
+            elif c_edges == min_edges and np.random.rand() < 0.5:
+                best_next = candidate
+
+        if best_next == -1:
+            if first_valid != -1:
+                best_next = first_valid
+            else:
+                for candidate in range(n):
+                    if not visited[candidate]:
+                        best_next = candidate
+                        break
+
+        current = best_next
+        
+    return child
+
+
+@njit
+def _cx_kernel(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    """O(N) Cycle Crossover."""
+    n = len(p1)
+    child = np.empty(n, dtype=np.int64)
+    visited = np.zeros(n, dtype=np.bool_)
+    pos2 = np.empty(n, dtype=np.int64)
+    for idx in range(n):
+        pos2[p2[idx]] = idx
+    use_p1 = True
+    for start in range(n):
+        if visited[start]:
+            continue
+        idx = start
+        while not visited[idx]:
+            visited[idx] = True
+            if use_p1:
+                child[idx] = p1[idx]
+            else:
+                child[idx] = p2[idx]
+            idx = pos2[p1[idx]]
+        use_p1 = not use_p1
+    return child
+
+
+def order_crossover(parent1, parent2, cfg) -> list:
+    child_tour = _ox_kernel(parent1.permutation, parent2.permutation)
+    return [_child_from_tour(child_tour, parent1, parent2, cfg)]
+
+def partially_mapped_crossover(parent1, parent2, cfg) -> list:
+    child_tour = _pmx_kernel(parent1.permutation, parent2.permutation)
+    return [_child_from_tour(child_tour, parent1, parent2, cfg)]
+
+def edge_crossover(parent1, parent2, cfg) -> list:
+    child_tour = _erx_kernel(parent1.permutation, parent2.permutation)
+    return [_child_from_tour(child_tour, parent1, parent2, cfg)]
+
+def cycle_crossover(parent1, parent2, cfg) -> list:
+    child_tour = _cx_kernel(parent1.permutation, parent2.permutation)
+    return [_child_from_tour(child_tour, parent1, parent2, cfg)]
+
+def c_s_order_crossover(parent1, parent2, cfg) -> list:
+    """CSOX relies on OX. Wrapper manages the multi-child generation."""
+    # Generate multiple OX children to represent subtour permutations
+    c1 = _ox_kernel(parent1.permutation, parent2.permutation)
+    c2 = _ox_kernel(parent2.permutation, parent1.permutation)
+    return [
+        _child_from_tour(c1, parent1, parent2, cfg),
+        _child_from_tour(c2, parent2, parent1, cfg)
+    ]
+
 
 
 
